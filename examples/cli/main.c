@@ -37,15 +37,12 @@
 #include "tick.h"
 #include "tmp102.h"
 #include "rfm69.h"
-#include "rfm69_link.h"
+#include "rflink.h"
 #include "spiflash.h"
 #include "past.h"
 #include "pastunits.h"
-
-/** Running in low power mode is experimental and will make attaching via the
- * BMP fail which can be fixed by returning to normal power mode.
- */
-static bool low_power = false;
+#include "lowpower.h"
+#include "libopencm3-additions.h"
 
 static past_t g_past;
 
@@ -76,9 +73,10 @@ static void temperature_handler(uint32_t argc, char *argv[]);
 static void temperature_alert_handler(uint32_t argc, char *argv[]);
 static void rfm_handler(uint32_t argc, char *argv[]);
 static void rtc_handler(uint32_t argc, char *argv[]);
-static void power_handler(uint32_t argc, char *argv[]);
 static void sleep_handler(uint32_t argc, char *argv[]);
 static void vcc_handler(uint32_t argc, char *argv[]);
+static void spiflash_handler(uint32_t argc, char *argv[]);
+static void flash_handler(uint32_t argc, char *argv[]);
 
 
 
@@ -163,13 +161,6 @@ cli_command_t commands[] = {
         .usage = "[set <h> <m> <s>]"
     },
     {
-        .cmd = "power",
-        .handler = power_handler,
-        .min_arg = 1, .max_arg = 1,
-        .help = "Handle low power mode",
-        .usage = "<low | normal>"
-    },
-    {
         .cmd = "sleep",
         .handler = sleep_handler,
         .min_arg = 1, .max_arg = 1,
@@ -181,6 +172,20 @@ cli_command_t commands[] = {
         .handler = vcc_handler,
         .min_arg = 0, .max_arg = 0,
         .help = "Measure VCC",
+        .usage = ""
+    },
+    {
+        .cmd = "spiflash",
+        .handler = spiflash_handler,
+        .min_arg = 0, .max_arg = 3,
+        .help = "Test SPI flash",
+        .usage = ""
+    },
+    {
+        .cmd = "flash",
+        .handler = flash_handler,
+        .min_arg = 0, .max_arg = 3,
+        .help = "Test internal flash",
         .usage = ""
     },
 };
@@ -348,7 +353,7 @@ static void rfm_init(void)
         return;
     }
     if (!past_read_unit(&g_past, past_rfm_key, (const void **) &aesKey, &len)) {
-        dbg_printf("ERROR: RFM ARM key missing\n");
+        dbg_printf("ERROR: RFM AES key missing\n");
         return;
     }
 
@@ -363,34 +368,15 @@ static void rfm_init(void)
         rfm69_setCSMA(true); // enable CSMA/CA algorithm
         rfm69_setAutoReadRSSI(true);
         (void) rfm69_setAESEncryption((void*) aesKey, 16);
-        rfm69link_setNodeId(*node_id);
-        rfm69link_setNetworkId(*network_id);
-        dbg_printf("OK\n");
-    }
-}
-
-static void past_set_uint32(parameter_id_t id, uint32_t value)
-{
-    dbg_printf("%d:%d\n", id, value);
-    if (past_write_unit(&g_past, id, (void*)&value, sizeof(value))) {
-        dbg_printf("OK\n");
-    } else {
-        dbg_printf("ERROR\n");
-    }
-}
-
-static void past_set_str(parameter_id_t id, char *str, uint32_t len)
-{
-   if (past_write_unit(&g_past, id, (void*)str, len)) {
-        dbg_printf("OK\n");
-    } else {
-        dbg_printf("ERROR\n");
+        rflink_setNodeId(*node_id);
+        rflink_setNetworkId(*network_id);
+        dbg_printf("RFM69 init ok\n");
     }
 }
 
 static void rfm_tx(uint32_t dst, char *data)
 {
-    rfm69_link_frame_t frame;
+    rflink_frame_t frame;
     dst &= 0xff;
 #if 0
     dbg_printf("Sending %d bytes to %d\n", strlen(data), dst);
@@ -398,7 +384,7 @@ static void rfm_tx(uint32_t dst, char *data)
     dump_mem((uint32_t) data, strlen(data));
 #endif
     memcpy((void*) frame.payload, (void*) data, strlen(data));
-    uint8_t status = rfm69link_sendFrame(dst, &frame, strlen(data));
+    uint8_t status = rflink_sendFrame(dst, &frame, strlen(data));
     if (!status) {
         dbg_printf("ERROR:No response\n");
     } else {
@@ -418,18 +404,18 @@ static void rfm_handler(uint32_t argc, char *argv[])
         }
     } else if (argc == 3) {
         if (strcmp(cmd, "id") == 0) {
-            past_set_uint32(past_rfm_node_id, atoi(argv[2]));
+            past_write_uint32(&g_past, past_rfm_node_id, atoi(argv[2]));
         } else if (strcmp(cmd, "net") == 0) {
-            past_set_uint32(past_rfm_net_id, atoi(argv[2]));
+            past_write_uint32(&g_past, past_rfm_net_id, atoi(argv[2]));
         } else if (strcmp(cmd, "gw") == 0) {
-            past_set_uint32(past_rfm_gateway_id, atoi(argv[2]));
+            past_write_uint32(&g_past, past_rfm_gateway_id, atoi(argv[2]));
         } else if (strcmp(cmd, "pwr") == 0) {
-            past_set_uint32(past_rfm_max_power, atoi(argv[2]));
+            past_write_uint32(&g_past, past_rfm_max_power, atoi(argv[2]));
         } else if (strcmp(cmd, "key") == 0) {
             if (strlen(argv[2]) != 16) {
                 dbg_printf("ERROR: key must be 16 bytes\n");
             } else {
-                past_set_str(past_rfm_key, argv[2], 16);
+                past_write_cstr(&g_past, past_rfm_key, argv[2]);
             }
         } else {
             dbg_printf("ERROR: Illegal command\n");
@@ -468,42 +454,14 @@ static void rtc_handler(uint32_t argc, char *argv[])
     }
 }
 
-static void power_handler(uint32_t argc, char *argv[])
-{
-    (void) argc;
-    if (strcmp(argv[1], "low") == 0) {
-        systick_deinit();
-        low_power = true;
-        dbg_printf("OK\n");
-    } else if (strcmp(argv[1], "normal") == 0) {
-        systick_init();
-        dbg_printf("OK\n");
-        low_power = false;
-    } else {
-        dbg_printf("Error: illegal argument\n");
-    }
-}
-
 static void sleep_handler(uint32_t argc, char *argv[])
 {
     (void) argc;
     uint32_t time_s = atoi(argv[1]);
-    rtcdrv_set_wakeup(time_s);
-    /** Sleep peripherals */
-    systick_deinit();
-    rfm69_sleep();
-    tmp102_sleep();
-    /** @todo: Tristate UART pins */
-    /** @todo: Tristate SPI pins */
-    /** @todo: Tristate I2C pins */
-
-    hw_stop_mode();
-    /** Yawn */
+    dbg_printf("Entering stop mode for %ds\n", time_s);
+    lp_sleep(time_s);
+    dbg_printf("OK\n", time_s);
     rtcdrv_set_wakeup(DEFAULT_RTC_WAKEUP_S);
-
-    /** Wake peripherals */
-    systick_init();
-    tmp102_wakeup();
 }
 
 static void vcc_handler(uint32_t argc, char *argv[])
@@ -514,6 +472,162 @@ static void vcc_handler(uint32_t argc, char *argv[])
     dbg_printf("%d.%02dV\n", vcc/1000, (vcc%1000)/10);
 }
 
+static void spiflash_handler(uint32_t argc, char *argv[])
+{
+    (void) argc;
+    (void) argv;
+
+    static uint8_t write_buf[256];
+    static uint8_t read_buf[256];
+
+    /** Write 00 01 02 03 .. ff to page 0 */
+    /** Write ff fe fd fc .. 00 to page 1 */
+    for (uint32_t i = 0; i < sizeof(write_buf); i++) {
+        write_buf[i] = i;
+    }
+    dbg_printf("Writing page 0\n");
+    if (!spiflash_write(0, sizeof(write_buf), (uint8_t*) write_buf)) {
+        dbg_printf("Failed\n");
+        return;
+    }
+
+    for (uint32_t i = 0; i < sizeof(write_buf); i++) {
+        write_buf[i] = ~i;
+    }
+    dbg_printf("Writing page 1\n");
+    if (!spiflash_write(256, sizeof(write_buf), (uint8_t*) write_buf)) {
+        dbg_printf("Failed\n");
+        return;
+    }
+
+    for (uint32_t i = 0; i < sizeof(write_buf); i++) {
+        write_buf[i] = i;
+    }
+
+    /** Verify writes */
+    memset(read_buf, 0xcd, sizeof(read_buf));
+    dbg_printf("Reading page 0\n");
+    if (!spiflash_read(0, sizeof(read_buf), (uint8_t*) read_buf)) {
+        dbg_printf("Failed\n");
+        return;
+    }
+    for (uint32_t i = 0; i < sizeof(write_buf); i++) {
+        if (write_buf[i] != read_buf[i]) {
+            dbg_printf("Failed\n");
+        }
+    }
+
+    for (uint32_t i = 0; i < sizeof(write_buf); i++) {
+        write_buf[i] = ~i;
+    }
+    memset(read_buf, 0xcd, sizeof(read_buf));
+    dbg_printf("Reading page 1\n");
+    if (!spiflash_read(256, sizeof(read_buf), (uint8_t*) read_buf)) {
+        dbg_printf("Failed\n");
+        return;
+    }
+    for (uint32_t i = 0; i < sizeof(write_buf); i++) {
+        if (write_buf[i] != read_buf[i]) {
+            dbg_printf("Failed\n");
+        }
+    }
+
+    /** Test page erase */
+    dbg_printf("Erasing page 0\n");
+    if (!spiflash_erase(0, sizeof(write_buf))) {
+        dbg_printf("Failed\n");
+        return;
+    }
+    if (!spiflash_read(0, sizeof(read_buf), (uint8_t*) read_buf)) {
+        dbg_printf("Failed\n");
+        return;
+    }
+    for (uint32_t i = 0; i < sizeof(read_buf); i++) {
+        if (read_buf[i] != 0xff) {
+            dbg_printf("Failed\n");
+        }
+    }
+
+    dbg_printf("Erasing page 1\n");
+    if (!spiflash_erase(256, sizeof(write_buf))) {
+        dbg_printf("Failed\n");
+        return;
+    }
+    if (!spiflash_read(256, sizeof(read_buf), (uint8_t*) read_buf)) {
+        dbg_printf("Failed\n");
+        return;
+    }
+    for (uint32_t i = 0; i < sizeof(read_buf); i++) {
+        if (read_buf[i] != 0xff) {
+            dbg_printf("Erase failed at %d (%02x)\n", i, read_buf[i]);
+        }
+    }
+
+
+    /** Test chip erase, Write data to page 0, erase chip, check page 0 */
+    dbg_printf("Testing chip erase\n");
+
+    for (uint32_t i = 0; i < sizeof(write_buf); i++) {
+        write_buf[i] = i;
+    }
+    if (!spiflash_write(0, sizeof(write_buf), (uint8_t*) write_buf)) {
+        dbg_printf("Failed\n");
+        return;
+    }
+    if (!spiflash_chip_erase()) {
+        dbg_printf("Failed\n");
+        return;
+    }
+    if (!spiflash_read(0, sizeof(read_buf), (uint8_t*) read_buf)) {
+        dbg_printf("Failed\n");
+        return;
+    }
+    for (uint32_t i = 0; i < sizeof(read_buf); i++) {
+        if (read_buf[i] != 0xff) {
+            dbg_printf("Erase failed at %d (%02x)\n", i, read_buf[i]);
+        }
+    }
+
+    dbg_printf("Success!\n");
+}
+
+static void flash_handler(uint32_t argc, char *argv[])
+{
+    (void) argc;
+    (void) argv;
+    dbg_printf("STM32L0 Flash Test\n");
+    uint32_t addr = 0x08007c00; /** Last kb */
+    uint32_t page_size = 128;
+    volatile uint8_t *p = (uint8_t*) addr;
+
+    dbg_printf("Testing write\n");
+    flash_unlock();
+    for (uint32_t i = 0; i < page_size; i+=4) {
+        flash_program_word(addr + i, 0xffffffff);
+    }
+    flash_lock();
+    for (uint32_t i = 0; i < page_size; i++) {
+        if (p[i] != 0xff) {
+            dbg_printf(" Write failed at %d: 0x%02x\n", i, p[i]);
+            dump_mem(addr, page_size);
+            break;
+        }
+    }
+
+    dbg_printf("Testing erase\n");
+    flash_unlock();
+    flash_erase_page(addr);
+    flash_lock();
+    for (uint32_t i = 0; i < page_size; i++) {
+        if (p[i] != 0) {
+            dbg_printf(" Erase failed at %d: 0x%02x\n", i, p[i]);
+            dump_mem(addr, page_size);
+            break;
+        }
+    }
+
+    dbg_printf("OK\n");
+}
 
 static void blinken_halt(uint32_t blink_count)
 {
@@ -544,49 +658,6 @@ static void dump_mem(uint32_t address, uint32_t length)
     }
     dbg_printf("\n");
 }
-
-#if 0
-static void flash_test(void)
-{
-    dbg_printf("\n\n *** flash test ***\n");
-
-    dump_mem(0x08007000, 16);
-    flash_unlock();
-    for (int i = 0; i < 1024; i+=4) {
-        flash_program_word(0x08007000 + i, 0xffffffff);
-    }
-    flash_lock();
-
-    dump_mem(0x08007000, 16);
-
-    dbg_printf("\n>>> Erasing 0x08007000\n");
-    flash_unlock();
-    flash_erase_page(0x08007000);
-    flash_lock();
-    dump_mem(0x08007000, 16);
-
-    dbg_printf("\n>>> Programming 0x08007000\n");
-    flash_unlock();
-    flash_program_word(0x08007000, 0x000000ff);
-    flash_lock();
-    dump_mem(0x08007000, 16);
-
-    dbg_printf("\n>>> Programming 0x08007000\n");
-    flash_unlock();
-    flash_program_word(0x08007000, 0xff000000);
-    flash_lock();
-    dump_mem(0x08007000, 16);
-
-    dbg_printf("\n>>> Programming 0x08007000\n");
-    flash_unlock();
-    flash_program_word(0x08007000, 0x00000000);
-    flash_lock();
-    dump_mem(0x08007000, 16);
-
-    dbg_printf("\n---\ndone\n");
-    while(1) ;
-}
-#endif
 
 /**
   * @brief Ye olde main
@@ -655,10 +726,6 @@ int main(void)
                 dbg_printf("%c", b & 0xff);
                 line[i++] = b;
             }
-        }
-        if (low_power) {
-            hw_stop_mode();
-            dbg_printf(".");
         }
     }
     return 0;

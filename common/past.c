@@ -63,7 +63,7 @@
  *    .
  *    .
  * [ 0x00000000 ] [ 0x00000000 ]
- * 
+ *
  * Each of the two Past blocks begin with the Past magic, followed by a past
  * counter which is increased by one for each garbage collection. The counter is
  * never expected to wrap as the number of erase cycles is far less than a 32
@@ -137,7 +137,9 @@ static bool past_erase_unit_at(uint32_t address);
 static bool past_garbage_collect(past_t *past);
 static bool eeprom_zero(uint32_t address, uint32_t length);
 static bool eeprom_write32(uint32_t address, uint32_t data);
+#ifndef CONFIG_PAST_MINIMAL
 static bool copy_parameters(past_t *past, uint32_t src_base, uint32_t dst_base);
+#endif // CONFIG_PAST_MINIMAL
 static uint32_t past_remaining_size(past_t *past);
 #define eeprom_read32(address) *(uint32_t*) (address)
 
@@ -150,7 +152,7 @@ static uint32_t past_remaining_size(past_t *past);
 bool past_init(past_t *past)
 {
     bool success = false;
-    if (past) {
+    if (past && past->blocks[0] && past->blocks[1]) {
         /** Check which block is the current one */
         uint32_t magic_1 = eeprom_read32(past->blocks[0]);
         uint32_t magic_2 = eeprom_read32(past->blocks[1]);
@@ -438,6 +440,10 @@ static uint32_t past_find_unit(past_t *past, past_id_t id)
   */
 static bool past_garbage_collect(past_t *past)
 {
+#ifdef CONFIG_PAST_MINIMAL
+    (void) past;
+    return false;
+#else // CONFIG_PAST_MINIMAL
     bool success = false;
     do {
         /** Format the new block */
@@ -460,6 +466,7 @@ static bool past_garbage_collect(past_t *past)
         /** Past is now ready for writing */
     } while(0);
     return success;
+#endif // CONFIG_PAST_MINIMAL
 }
 
 /**
@@ -506,6 +513,7 @@ static bool eeprom_write32(uint32_t address, uint32_t data)
   * @param dst_base destination base address
   * @retval true if copying was successful
   */
+#ifndef CONFIG_PAST_MINIMAL
 static bool copy_parameters(past_t *past, uint32_t src_base, uint32_t dst_base)
 {
     bool success = true;
@@ -538,4 +546,53 @@ static bool copy_parameters(past_t *past, uint32_t src_base, uint32_t dst_base)
         past->_end_addr = dst;
     }
     return success;
+}
+#endif // CONFIG_PAST_MINIMAL
+
+/**
+ * @brief      Convenience function for writing an uint32_t to past
+ *
+ * @param[in]  id     the past unit
+ * @param[in]  value  the value
+ *
+ * @return     true if writing went well
+ */
+bool past_write_uint32(past_t *past, past_id_t id, uint32_t value)
+{
+    return past_write_unit(past, id, (void*)&value, sizeof(uint32_t));
+}
+
+/**
+ * @brief      Convenience function for reading an uint32_t from past
+ *
+ * @param[in]  id     the past unit
+ * @param[in]  value  the value
+ *
+ * @return     true if unit existed and reading went well
+ */
+bool past_read_uint32(past_t *past, past_id_t id, uint32_t *value)
+{
+    uint32_t length;
+    uint32_t *temp;
+    if (past_read_unit(past, id, (const void**)&temp, &length)) {
+        if (length == sizeof(uint32_t)) {
+            *value = *temp;
+            return true;
+        }
+    }
+    return false;
+}
+
+/**
+ * @brief      Convenience function for writing C string (including zero
+ *             terminator) to past
+ *
+ * @param[in]  id     the past unit
+ * @param[in]  str  the string
+ *
+ * @return     true if writing went well
+ */
+bool past_write_cstr(past_t *past, past_id_t id, char *str)
+{
+   return past_write_unit(past, id, (void*)str, strlen(str) + 1);
 }

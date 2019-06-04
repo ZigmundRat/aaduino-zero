@@ -36,7 +36,9 @@
 #include <libopencmsis/core_cm3.h>
 #include "dbg_printf.h"
 #include "tick.h"
-#include "sw_i2c.h"
+#ifndef CONFIG_SKIP_I2C
+ #include "sw_i2c.h"
+#endif // CONFIG_SKIP_I2C
 #include "hw.h"
 #include "spi_driver.h"
 
@@ -51,12 +53,13 @@ static void copy_vectors(void);
 
 static void tim2_init(void);
 static void clock_init(void);
-static void usart_init(void);
+static void usart_init(bool enable_rx);
 static void gpio_init(void);
 static void exti_init(void);
+#ifndef CONFIG_SKIP_I2C
 static void i2c_init(void);
+#endif // CONFIG_SKIP_I2C
 static void spi_init(void);
-static void adc_init(void);
 static void lse_init(void);
 //static void button_irq_init(void);
 
@@ -87,14 +90,14 @@ void hw_init(ringbuf_t *usart_rx_buf)
     copy_vectors();
 #endif // CONFIG_RAM_VECTORS
     clock_init();
-#ifndef CONFIG_LOW_POWER_MODE
     systick_init();
-#endif // CONFIG_LOW_POWER_MODE
     gpio_init();
-    usart_init();
+    usart_init(usart_rx_buf != 0);
     exti_init();
     tim2_init();
+#ifndef CONFIG_SKIP_I2C
     i2c_init();
+#endif // CONFIG_SKIP_I2C
     spi_init();
     adc_init();
     lse_init();
@@ -150,16 +153,6 @@ void adc_disable(void)
     adc_power_off(ADC1);
 }
 
-
-/**
-  * @brief Check if SEL button is pressed
-  * @retval true if SEL button is pressed, false otherwise
-  */
-//bool hw_sel_button_pressed(void)
-//{
-//    return !gpio_get(BUTTON_SEL_PORT, BUTTON_SEL_PIN);
-//}
-
 /**
   * @brief Enable clocks
   * @retval None
@@ -214,9 +207,9 @@ static void clock_init(void)
     rcc_osc_off(RCC_PLL);
     while (rcc_is_osc_ready(RCC_PLL));
     flash_prefetch_enable();
-    flash_set_ws(0);
+    flash_set_ws(1);
 
-#warning "*** Add mode for 4MHz HSI16 mode ***"
+    /** @todo: Add mode for 4MHz HSI16 mode */
 
     /* Set up the PLL */
     rcc_set_pll_multiplier(RCC_CFGR_PLLMUL_MUL4);
@@ -241,6 +234,7 @@ static void clock_init(void)
     rcc_periph_clock_enable(RCC_SPI1);
 }
 
+#ifndef CONFIG_SKIP_I2C
 /**
   * @brief Initialize I2C1
   * @retval None
@@ -308,6 +302,7 @@ static void i2c_init(void)
     i2c_peripheral_enable(I2C1);
 #endif
 }
+#endif // CONFIG_SKIP_I2C
 
 /**
   * @brief Initialize SPI1
@@ -337,9 +332,10 @@ static void spi_init(void)
 
 /**
   * @brief Initialize USART1
+  * @param enable_rx if true, enable USART RX
   * @retval None
   */
-static void usart_init(void)
+static void usart_init(bool enable_rx)
 {
     /* Setup USART1 parameters. */
     rcc_periph_clock_enable(RCC_USART1);
@@ -347,23 +343,26 @@ static void usart_init(void)
     usart_set_databits(USART1, 8);
     usart_set_parity(USART1, USART_PARITY_NONE);
     usart_set_stopbits(USART1, USART_CR2_STOPBITS_1);
-    usart_set_mode(USART1, USART_MODE_TX_RX); // USART_MODE_TX);
     usart_set_flow_control(USART1, USART_FLOWCONTROL_NONE);
     usart_enable(USART1);
-    nvic_enable_irq(NVIC_USART1_IRQ);
-    usart_enable_rx_interrupt(USART1);
+    if (enable_rx) {
+        usart_set_mode(USART1, USART_MODE_TX_RX);
+        nvic_enable_irq(NVIC_USART1_IRQ);
+        usart_enable_rx_interrupt(USART1);
+    }
     dbg_printf("\n---\n");
 }
 
 void usart1_isr(void)
 {
+    /** @todo: this code hangs if pasting lots and lots of characters into the terminal */
     if ((USART_CR1(USART1) & USART_CR1_RXNEIE) != 0 &&
         (USART_ISR(USART1) & USART_ISR_RXNE) != 0) {
         uint16_t ch = usart_recv(USART1);
         if ((USART_ISR(USART1) & USART_ISR_ORE) == 0 &&
             (USART_ISR(USART1) & USART_ISR_FE) == 0 &&
             (USART_ISR(USART1) & USART_ISR_PE) == 0) {
-            if (!ringbuf_put(rx_buf, ch)) {
+            if (rx_buf && !ringbuf_put(rx_buf, ch)) {
                 //printf("ASSERT:usart1_isr:%d\n", __LINE__);
             }
         } else {
@@ -462,7 +461,7 @@ static void button_irq_init(void)
   * @brief Initialize the ADC for vref int messurements
   * @retval None
   */
-static void adc_init(void)
+void adc_init(void)
 {
     rcc_peripheral_enable_clock(&RCC_APB2ENR, RCC_APB2ENR_ADC1EN);
     adc_power_off(ADC1);
@@ -494,11 +493,11 @@ static void lse_init(void)
         protected after reset, the DBP bit in the Power control register
         (PWR_CR) has to be set to be able to modify them. Refer to
         Section 6.1.2: RTC and RTC backup registers for further information.
-        
+
         These bits are only reset after a RTC domain reset (see Section 6.1.2).
         Any internal or external reset does not have any effect on them.
     */
-    
+
     // Allow change or LSE drive strength
     RCC_APB1ENR |= RCC_APB1ENR_PWREN;
     PWR_CR |= PWR_CR_DBP;
@@ -516,21 +515,4 @@ static void lse_init(void)
     } else {
         dbg_printf("LSE failed to start! (drive strength %d)\n", (RCC_CSR >> RCC_CSR_LSEDRV_SHIFT) & RCC_CSR_LSEDRV_MASK);
     }
-}
-
-/**
- * @brief      Enter low stop mode and wait for interrupt
- */
-void hw_stop_mode(void)
-{
-    /** @todo: check if this is the right way to do it */
-
-    /** 6.4.1: If ULP=1 and FWU = 0: Exiting from low-power mode occurs only
-     * when the VREFINT is ready */
-    PWR_CR &= ~PWR_CR_FWU;
-    PWR_CR |= ~PWR_CR_ULP;
-
-    PWR_CR |= PWR_CR_LPSDSR;
-    pwr_set_stop_mode();
-    __WFI();
 }

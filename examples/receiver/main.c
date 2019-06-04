@@ -33,14 +33,13 @@
 #include "tick.h"
 #include "tmp102.h"
 #include "rfm69.h"
-#include "rfm69_link.h"
+#include "rflink.h"
 #include "spiflash.h"
+#include "rtcdrv.h"
+#include "bootcom.h"
+#include "rfprotocol.h"
 
 //#define CONFIG_RX_DEBUG
-
-#define NODE_ID                    (1) // I am the gateway
-#define TEMPERATURE_PACKET_SIZE   (10) // Temperature packet size
-#define TEMPERATURE_FRAME_TYPE     (0) // Frame type for temperature packet
 
 static void blinken_halt(uint32_t blink_count)
 {
@@ -81,11 +80,30 @@ static void handle_temperature_frame(uint8_t src, uint8_t *payload, uint8_t len,
 
 
 /**
+  * @brief Handle fault packet
+  * @param payload Fault payload
+  * @param len Payload length
+  */
+static void handle_fault_frame(uint8_t src, uint8_t *payload, uint8_t len, int rssi)
+{
+    if (len != 3*4) {
+        dbg_printf("Illegal fault payload length %d\n", len);
+    } else {
+        //  <pc:32> <lr:32> <uptime:32>
+        int32_t pc = (payload[0] << 24) | (payload[1] << 16) | (payload[2] << 8) | (payload[3]);
+        int32_t lr = (payload[4] << 24) | (payload[5] << 16) | (payload[6] << 8) | (payload[7]);
+        int32_t uptime = (payload[8] << 24) | (payload[9] << 16) | (payload[10] << 8) | (payload[11]);
+        dbg_printf("Node %d crashed at 0x%08x after %d seconds, ", src, pc, uptime);
+        dbg_printf("lr:0x%08x rssi:%d\n", lr, rssi);
+    }
+}
+
+/**
   * @brief Dump packet
   * @param packet Pointer to packet data
   * @param len Length of packet
   */
-static void dump_frame(rfm69_link_frame_t *frame, uint8_t len)
+static void dump_frame(rflink_frame_t *frame, uint8_t len)
 {
     dbg_printf("%02x -> %02x ", frame->_src, frame->_dst);
     dbg_printf("cnt:%02d flags:%x : [ ", FRAME_COUNTER(frame->_cntr_flags), FRAME_FLAGS(frame->_cntr_flags));
@@ -95,6 +113,28 @@ static void dump_frame(rfm69_link_frame_t *frame, uint8_t len)
     dbg_printf("] (%d)\n", frame->rssi);
 }
 
+
+/**
+ * @brief      Check for crash dump
+ */
+static void check_crash(void)
+{
+    if (bootcom_get_size() > 0) {
+        if (bootcom_get(0) == 0xdeadc0de) {
+            dbg_printf("\n\n**** GURU MEDITATION DETECTED ****\n");
+            dbg_printf("r0    : 0x%08x\n", bootcom_get(1));
+            dbg_printf("r1    : 0x%08x\n", bootcom_get(2));
+            dbg_printf("r2    : 0x%08x\n", bootcom_get(3));
+            dbg_printf("r3    : 0x%08x\n", bootcom_get(4));
+            dbg_printf("r12   : 0x%08x\n", bootcom_get(5));
+            dbg_printf("lr    : 0x%08x\n", bootcom_get(6));
+            dbg_printf("pc    : 0x%08x\n", bootcom_get(7));
+            dbg_printf("psr   : 0x%08x\n", bootcom_get(8));
+            dbg_printf("uptime  %ds\n", bootcom_get(9));
+            bootcom_clear();
+        }
+    }
+}
 
 /**
   * @brief Ye olde main
@@ -107,35 +147,49 @@ int main(void)
     dbg_printf("\n\nWelcome to the AAduino Zero Receiver Example\n");
 
     (void) tmp102_init();
-
+    rtcdrv_init();
+    rtcdrv_set_wakeup(1);
     rfm69_setResetPin(RFM_RESET_PORT, RFM_RESET_PIN);
     rfm69_reset();
     if (!rfm69_init(SPI1_RFM_CS_PORT, SPI1_RFM_CS_PIN, false)) {
         dbg_printf("No RFM69CW found\n");
         blinken_halt(1);
     } else {
-        dbg_printf("RFM69CW found\n");
+        dbg_printf("RFM69CW found, my node id is %d\n", CONFIG_NODEID);
         rfm69_sleep(); // init RF module and put it to sleep
         rfm69_setPowerDBm(13); // // set output power, +13 dBm
         rfm69_setCSMA(true); // enable CSMA/CA algorithm
         rfm69_setAutoReadRSSI(true);
-        (void) rfm69_setAESEncryption((void*) "sampleEncryptKey", 16);
-        rfm69link_setNodeId(NODE_ID);
+        if (strlen(CONFIG_AESKEY) != 16) {
+            dbg_printf("Error: AES key must be 16 bytes!\n");
+        }
+        (void) rfm69_setAESEncryption((void*) CONFIG_AESKEY, 16);
+        rflink_setNodeId(CONFIG_NODEID);
     }
 
+    check_crash();
+
     while(1) {
-        rfm69_link_frame_t frame;
+        rflink_frame_t frame;
         uint8_t src, length;
-        if (rfm69link_receiveFrame(&src, &frame, &length)) {
+        if (rflink_receiveFrame(&src, &frame, &length)) {
             hw_set_led(true);
 #ifdef CONFIG_RX_DEBUG
             dump_frame(&frame, length);
 #endif // CONFIG_RX_DEBUG
             if (length > 0) {
+                /** Chop off frame type from payload */
+                uint8_t *payload = &frame.payload[1];
+                uint8_t payload_len = length-1;
                 switch(frame.payload[0]) {
-                    case TEMPERATURE_FRAME_TYPE:
-                        /** Chop off frame type */
-                        handle_temperature_frame(src, &frame.payload[1], length-1, frame.rssi);
+                    case rf_temperature:
+                        handle_temperature_frame(src, payload, payload_len, frame.rssi);
+                        break;
+                    case rf_powerup:
+                        dbg_printf("Node %d powered up\n", src);
+                        break;
+                    case rf_hard_fault:
+                        handle_fault_frame(src, payload, payload_len, frame.rssi);
                         break;
                     default:
                         dbg_printf("Unknown packet type 0x%02x\n", frame.payload[0]);

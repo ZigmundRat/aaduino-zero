@@ -3,6 +3,12 @@
 #include "sw_i2c.h"
 #include "hw.h"
 
+/**
+ *
+ * @todo: replace this with a HW implementation ("big fat todo" that is)
+ *
+ */
+
 // I2C driver for ESP8266 written for use with esp-open-rtos
 // Based on https://en.wikipedia.org/wiki/I²C#Example_of_bit-banging_the_I.C2.B2C_Master_protocol
 
@@ -228,5 +234,19 @@ bool i2c_read_reg16(uint8_t slave_addr, uint8_t reg, uint16_t *val)
     r[1] = sw_i2c_read(1);
     sw_i2c_stop();
     *val = r[0] << 8 | r[1];
+    return true;
+}
+
+bool i2c_write_reg16(uint8_t slave_addr, uint8_t reg, uint16_t val)
+{
+    sw_i2c_start();
+    if (!sw_i2c_write(slave_addr << 1)) {
+        dbg_printf("Write 1 failed\n");
+        return false;
+    }
+    sw_i2c_write(reg);
+    sw_i2c_write((val >> 8) & 0xff);
+    sw_i2c_write( val       & 0xff);
+    sw_i2c_stop();
     return true;
 }
